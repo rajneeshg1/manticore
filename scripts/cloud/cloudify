@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+
+# Modified from algo-ng
+# https://github.com/trailofbits/algo-ng
+
+SENSITIVE_PROMPT="[pasted values will not be displayed]"
+TRUE="^(y|Y|true)$"
+REGIONS_PATH="./regions"
+
+describeRegions(){
+  index=1
+  while IFS="," read code name default; do
+    printf "\n%2s. %-${ALGN:-5}s %s" $index "$code" "$name"
+    ((index++))
+  done < ${REGIONS_PATH}/${1}
+}
+
+getRegionCodeByIndex(){
+  sed "${2}q;d" ${REGIONS_PATH}/${1} | cut -f1 -d,
+}
+
+getDefaultRegion(){
+  index=1
+  while IFS="," read code name default; do
+    if [[ "$default" == "default" ]]; then
+      default=${index}
+      echo "$default"
+      break
+    fi
+    ((index++))
+  done < ${REGIONS_PATH}/${1}
+
+}
+
+askForRegion(){
+  local default="$(getDefaultRegion ${ALGO_PROVIDER})"
+  echo -e "\nWhat region should the server be located in?" \
+    "\n$(describeRegions $1)" \
+    "\nEnter the number of your desired region:"
+  read -p "[${default}]: " -r region
+  region=${region:-$default}
+  TF_VAR_region="$(getRegionCodeByIndex "$1" $region)"
+}
+
+digitalocean () {
+  if [[ -z $DIGITALOCEAN_TOKEN ]]; then
+    echo -e "\nEnter your API token. The token must have read and write permissions" \
+            "(https://cloud.digitalocean.com/settings/api/tokens):" \
+            "\n$SENSITIVE_PROMPT"
+    read -p ": " -rs DIGITALOCEAN_TOKEN
+  fi
+
+  if [[ -z $MCORE_REGION && "$MCORE_COMMAND" == "apply" ]]; then
+    askForRegion ${MCORE_PROVIDER}
+  else
+    TF_VAR_region="$MCORE_REGION"
+  fi
+
+  export  DIGITALOCEAN_TOKEN=$DIGITALOCEAN_TOKEN \
+          MCORE_SERVER_NAME=${MCORE_SERVER_NAME}
+}
+
+
+mcore_provisioning () {
+
+  if [[ -z $MCORE_PROVIDER && "$MCORE_COMMAND" == "apply"  ]]; then
+    echo -e "\nWhat provider would you like to use?\n" \
+            "\n 1. DigitalOcean" \
+            "\n\nEnter the number of your desired provider"
+    read -p ": " -r MCORE_PROVIDER
+  fi
+
+  local default=${USER}-mcore
+  if [[ -z $MCORE_SERVER_NAME && "$MCORE_COMMAND" == "apply" ]]; then
+    echo -e '\nName the server:'
+    read -p "[${default}]: " -r MCORE_SERVER_NAME
+  fi
+  export MCORE_SERVER_NAME=${MCORE_SERVER_NAME:-${default}}
+
+  local usertag=${USER}
+  if [[ -z $MCORE_USER_TAG && "$MCORE_COMMAND" == "apply" ]]; then
+    echo -e '\nTag to identify yourself:'
+    read -p "[${usertag}]: " -r MCORE_USER_TAG
+  fi
+  export MCORE_USER_TAG=${MCORE_USER_TAG:-${usertag}}
+
+  if [ ! -f "$(pwd)/keys/mcore.key" ]
+  then
+    ssh-keygen -q -t ed25519 -f $(pwd)/keys/mcore.key -P "" -C "terraform/mcore"
+  fi
+  export TF_VAR_pub_key=$(pwd)/keys/mcore.key.pub
+  export TF_VAR_pvt_key=$(pwd)/keys/mcore.key
+
+  case "$MCORE_PROVIDER" in
+    1|digitalocean) MCORE_PROVIDER=digitalocean; digitalocean; ;;
+#    2|ec2) ALGO_PROVIDER=ec2; aws; ;;
+#    3|azure) ALGO_PROVIDER=azure; azure; ;;
+#    4|gce) ALGO_PROVIDER=gce; gce; ;;
+    *) exit 1 ;;
+  esac
+
+  export  TF_CLI_ARGS_apply+=" -auto-approve -parallelism=1" \
+          TF_VAR_user_tag="${MCORE_USER_TAG}" \
+          TF_VAR_box_name="${MCORE_SERVER_NAME}" \
+          TF_VAR_mcore_provider="${MCORE_PROVIDER}" \
+          TF_VAR_region="$TF_VAR_region"
+
+
+  if [[ "$MCORE_COMMAND" == "apply" ]]; then
+    ${TERRAFORM_BIN} workspace select ${MCORE_PROVIDER}-${TF_VAR_region}-${MCORE_SERVER_NAME} \
+      || ${TERRAFORM_BIN} workspace new ${MCORE_PROVIDER}-${TF_VAR_region}-${MCORE_SERVER_NAME}
+    ${TERRAFORM_BIN} init providers/$MCORE_PROVIDER/
+  fi
+
+  ${TERRAFORM_BIN} ${MCORE_COMMAND:-apply} cloud/${MCORE_PROVIDER}/
+}
+
+help () {
+  echo "Usage: $0 <command>
+  The available commands for execution are listed below.
+  Common commands:
+      apply              Builds or changes infrastructure
+      destroy            Destroy Terraform-managed infrastructure
+  "
+  exit 0
+}
+
+locate_terraform () {
+  export TERRAFORM_BIN=$(which ./terraform || which terraform)
+  if [[ "$TERRAFORM_BIN" == "" ]]; then
+    echo "Terraform binary is not found.  Please install terraform."
+    exit 1
+  fi
+}
+
+apply () {
+  locate_terraform
+
+  export MCORE_COMMAND="apply"
+  mcore_provisioning
+}
+
+destroyResources () {
+  locate_terraform
+
+  CURRENT_WORKSPACE="$(${TERRAFORM_BIN} workspace list | grep "^*" | awk '{print $2}')"
+
+  if [[ -z $WORKSPACE ]]; then
+    echo -e "\nWhat workspace you want to destroy?\n" \
+      "\n$(${TERRAFORM_BIN} workspace list)\n" \
+      "\nEnter the full name of the workspace: "
+    read -p "[${CURRENT_WORKSPACE}]: " -r workspace
+
+    export WORKSPACE=${workspace:-$CURRENT_WORKSPACE}
+  fi
+
+  ${TERRAFORM_BIN} workspace select "${WORKSPACE}" || exit 1
+
+  export MCORE_COMMAND="destroy"
+  export MCORE_PROVIDER=$(echo ${WORKSPACE} | cut -f1 -d-)
+  export MCORE_REGION=$(echo ${WORKSPACE} | cut -f2 -d-)
+  export TF_VAR_region="${MCORE_REGION}"
+
+  mcore_provisioning
+
+  ${TERRAFORM_BIN} workspace select default
+  ${TERRAFORM_BIN} workspace delete ${WORKSPACE}
+}
+
+destroy () {
+  locate_terraform
+  destroyResources
+}
+
+case "$1" in
+  apply)         apply         ;;
+  destroy)       destroy       ;;
+  *)             help "$@"     ;;
+esac
